@@ -44,9 +44,13 @@ const config = {
   internalSecret:   process.env.INTERNAL_SECRET || 'dev-internal-secret',
 
   // MongoDB — if set, all data persists to MongoDB (write-through cache).
-  // If not set, falls back to in-memory only (dev mode, data lost on restart).
   mongodbUrl: process.env.MONGODB_URL || '',
   mongodbDb:  process.env.MONGODB_DB  || 'quantvexa',
+
+  // Residential server URL — when set, the bridge forwards data operations
+  // to the residential server (the "source of truth" on the home computer).
+  // When NOT set, Node.js runs standalone (in-memory + native services).
+  residentialUrl: process.env.RESIDENTIAL_SERVER_URL || '',
 
   // Admin credentials (for the admin dashboard login)
   adminEmail:    process.env.ADMIN_EMAIL    || 'admin@dashboard.io',
@@ -572,6 +576,100 @@ const nativeServices = {
 };
 
 // ============================================================================
+// RESIDENTIAL BRIDGE — when RESIDENTIAL_SERVER_URL is set, forwards requests
+// to the residential server (the home computer). When NOT set, uses the
+// native services above (standalone mode).
+// ============================================================================
+async function residentialCall(path, opts = {}) {
+  if (!config.residentialUrl) return null;
+  const url = `${config.residentialUrl}${path}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), opts.timeout ?? 8000);
+  try {
+    const r = await fetch(url, {
+      method: opts.method || 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Secret': config.internalSecret,
+        ...(opts.headers || {}),
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await r.text();
+    let data;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (!r.ok) {
+      logger.warn('residential call non-2xx', { path, status: r.status });
+      return null;
+    }
+    return data?.data ?? data;
+  } catch (err) {
+    logger.warn('residential call failed', { path, err: err.message });
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Unified service layer — tries residential server first, falls back to native
+const services = {
+  // Candle
+  async getSymbols() {
+    const remote = await residentialCall('/candle/symbols');
+    return remote !== null ? remote : nativeServices.getSymbols();
+  },
+  async getCandles(symbol, timeframe, limit) {
+    const remote = await residentialCall(`/candle/candles/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`);
+    return remote !== null ? remote : nativeServices.getCandles(symbol, timeframe, limit);
+  },
+  // Telegram
+  async sendTelegramMessage(tgUserId, text) {
+    if (config.residentialUrl) {
+      await residentialCall('/telegram/send', { method: 'POST', body: { tg_user_id: tgUserId, text } });
+    }
+    return services.sendTelegramMessage(tgUserId, text);
+  },
+  async notifySubscriptionUpdate(tgUserId, status, planName) {
+    if (config.residentialUrl) {
+      await residentialCall('/telegram/notify-subscription', { method: 'POST', body: { tg_user_id: tgUserId, status, plan_name: planName } });
+    }
+    return services.notifySubscriptionUpdate(tgUserId, status, planName);
+  },
+  // Signals
+  async controlBot(strategy, action) {
+    if (config.residentialUrl) {
+      const remote = await residentialCall('/signals/bot/control', { method: 'POST', body: { strategy, action } });
+      if (remote) return remote;
+    }
+    return services.controlBot(strategy, action);
+  },
+  async getBotStatus() {
+    const remote = await residentialCall('/signals/bot/status');
+    return remote !== null ? remote : nativeServices.getBotStatus();
+  },
+  async getRecentSignals(limit) {
+    const remote = await residentialCall(`/signals/list?limit=${limit}`);
+    return remote !== null ? remote : nativeServices.getRecentSignals(limit);
+  },
+  // Discount codes
+  async validateDiscount(code) {
+    if (config.residentialUrl) {
+      const remote = await residentialCall('/discount/validate', { method: 'POST', body: { code } });
+      if (remote) return remote;
+    }
+    // Local fallback — basic discount codes
+    const DISCOUNTS = {
+      'SAVE10':    { code: 'SAVE10',    percent: 10,  label: '10% off' },
+      'WELCOME20': { code: 'WELCOME20', percent: 20,  label: '20% off' },
+      'PRO50':     { code: 'PRO50',     percent: 50,  label: '50% off' },
+      'VIP100':    { code: 'VIP100',    percent: 100, label: '100% off' },
+    };
+    return DISCOUNTS[code.toUpperCase()] || null;
+  },
+};
+
+// ============================================================================
 // DATA STORE — in-memory Maps/arrays with MongoDB write-through persistence.
 // All reads are synchronous (fast). All writes also persist to MongoDB
 // (fire-and-forget) so data survives restarts. On boot, loadFromDB()
@@ -814,7 +912,7 @@ const PLATFORMS = [
 const serversService = {
   async listPlatforms() {
     try {
-      const status = await nativeServices.getBotStatus();
+      const status = await services.getBotStatus();
       if (status?.data?.platforms) return status.data.platforms;
     } catch (_) { /* fall through to local */ }
     return PLATFORMS;
@@ -822,7 +920,7 @@ const serversService = {
   async togglePlatform(id, running) {
     const p = PLATFORMS.find(x => x.id === id);
     if (p) p.running = running;
-    try { await nativeServices.controlBot(id.toLowerCase(), running ? 'start' : 'stop'); }
+    try { await services.controlBot(id.toLowerCase(), running ? 'start' : 'stop'); }
     catch (err) { logger.warn('python controlBot failed', { id, err: err.message }); }
     return p;
   },
@@ -830,7 +928,7 @@ const serversService = {
   async toggleStrategy(id, enabled) {
     const s = STRATEGIES.find(x => x.id === id);
     if (s) s.enabled = enabled;
-    try { await nativeServices.controlBot(id, enabled ? 'start' : 'stop'); }
+    try { await services.controlBot(id, enabled ? 'start' : 'stop'); }
     catch (err) { logger.warn('python controlBot failed', { id, err: err.message }); }
     return s;
   },
@@ -875,7 +973,7 @@ const subscriptionsService = {
         autoRenewal: true,
       });
     }
-    try { await nativeServices.notifySubscriptionUpdate(req.tgId, 'approved', req.planName); }
+    try { await services.notifySubscriptionUpdate(req.tgId, 'approved', req.planName); }
     catch (err) { logger.warn('failed to notify telegram bot of approval', { id, err: err.message }); }
     logger.info('subscription approved', { id, plan: req.planName });
     return dataStore.getSubRequest(id);
@@ -885,7 +983,7 @@ const subscriptionsService = {
     if (!req) { const e = new Error('Request not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e; }
     if (req.status !== 'pending') { const e = new Error(`Request already ${req.status}`); e.status = 400; e.code = 'ALREADY_RESOLVED'; throw e; }
     dataStore.updateSubRequest(id, { status: 'rejected', adminNote });
-    try { await nativeServices.notifySubscriptionUpdate(req.tgId, 'rejected', req.planName); }
+    try { await services.notifySubscriptionUpdate(req.tgId, 'rejected', req.planName); }
     catch (err) { logger.warn('failed to notify telegram bot of rejection', { id, err: err.message }); }
     logger.info('subscription rejected', { id });
     return dataStore.getSubRequest(id);
@@ -914,15 +1012,15 @@ const signalsService = {
     const local = dataStore.listSignals(limit);
     if (local.length > 0) return local;
     try {
-      const remote = await nativeServices.getRecentSignals(limit);
+      const remote = await services.getRecentSignals(limit);
       return Array.isArray(remote) ? remote : (remote?.data || []);
     } catch (err) { logger.warn('failed to fetch signals from python', { err: err.message }); return []; }
   },
   async botStatus() {
-    try { return await nativeServices.getBotStatus(); }
+    try { return await services.getBotStatus(); }
     catch (err) { logger.warn('bot status fetch failed', { err: err.message }); return null; }
   },
-  async controlBot(strategy, action) { return await nativeServices.controlBot(strategy, action); },
+  async controlBot(strategy, action) { return await services.controlBot(strategy, action); },
 };
 
 // ============================================================================
@@ -936,7 +1034,7 @@ const supportService = {
     });
     const msg = dataStore.addMessage(convo.id, { from: 'user', text: text || '', image: image || null });
     try {
-      await nativeServices.sendTelegramMessage(0, `💬 New support message from ${convo.userName || tgUser.id}:\n\n${text || '(image)'}`);
+      await services.sendTelegramMessage(0, `💬 New support message from ${convo.userName || tgUser.id}:\n\n${text || '(image)'}`);
     } catch (err) { logger.warn('failed to forward user message to telegram bot', { err: err.message }); }
     if (broadcastSupportFn) broadcastSupportFn({ convoId: convo.id, msg, event: 'user_message' });
     return { convo, msg };
@@ -1044,14 +1142,14 @@ app.get('/api/signals/:id', authMiddleware, (req, res) => {
 
 // --- Candles (proxied to Python candle service) ---
 app.get('/api/symbols', authMiddleware, async (req, res, next) => {
-  try { return ok(res, await nativeServices.getSymbols()); }
+  try { return ok(res, await services.getSymbols()); }
   catch (err) { logger.warn('candle /symbols proxy failed', { err: err.message }); return ok(res, []); }
 });
 app.get('/api/candles/:symbol', authMiddleware, async (req, res, next) => {
   try {
     const timeframe = (req.query.timeframe || '1m');
     const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
-    return ok(res, await nativeServices.getCandles(req.params.symbol, timeframe, limit));
+    return ok(res, await services.getCandles(req.params.symbol, timeframe, limit));
   } catch (err) { logger.warn('candle proxy failed', { symbol: req.params.symbol, err: err.message }); return ok(res, []); }
 });
 
@@ -1198,6 +1296,159 @@ app.post('/api/admin/offers/:id/toggle', (req, res) => {
   const o = dataStore.toggleOffer(req.params.id);
   if (!o) return failNotFound(res, 'Offer not found');
   return ok(res, o);
+});
+
+// ============================================================================
+// ADDITIONAL ENDPOINTS — discount validation, dashboard stats, admin signals,
+// admin support reply, user ban/unban/promote, bot session control
+// ============================================================================
+
+// --- Discount code validation (for the plans page checkout) ---
+app.post('/api/discounts/validate', authMiddleware, async (req, res, next) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return failBadRequest(res, 'Discount code required');
+    const result = await services.validateDiscount(code);
+    if (!result) return failNotFound(res, 'Invalid or expired discount code');
+    return ok(res, result);
+  } catch (err) { next(err); }
+});
+
+// --- Dashboard stats (for the admin dashboard overview) ---
+app.get('/api/admin/dashboard-stats', (req, res) => {
+  const users = dataStore.listUsers();
+  const totalUsers = users.length;
+  const activeUsers = users.filter(u => u.subscriptionStatus === 'ACTIVE').length;
+  const bannedUsers = users.filter(u => u.status === 'BANNED').length;
+  const pendingSubs = dataStore.listSubRequests({ status: 'pending' }).length;
+  const approvedSubs = dataStore.listSubRequests({ status: 'approved' }).length;
+  const totalRevenue = users.reduce((sum, u) => sum + (u.subscriptionAmount || 0), 0);
+  const activeSignals = collections.signals.filter(s => s.result === null).length;
+  const totalSignals = collections.signals.length;
+  const openConvos = [...collections.convos.values()].filter(c => c.id?.startsWith('c_') && c.status === 'open').length;
+  const unreadConvos = [...collections.convos.values()].filter(c => c.id?.startsWith('c_') && c.unread > 0).length;
+  return ok(res, {
+    users: { total: totalUsers, active: activeUsers, banned: bannedUsers },
+    subscriptions: { pending: pendingSubs, approved: approvedSubs },
+    revenue: { total: totalRevenue, currency: 'USD' },
+    signals: { total: totalSignals, active: activeSignals },
+    support: { openConvos, unreadConvos },
+    notifications: collections.notifications.length,
+    promos: collections.promos.length,
+    offers: collections.offers.length,
+    timestamp: Date.now(),
+  });
+});
+
+// --- Admin signals list (all signals, not just user's own) ---
+app.get('/api/admin/signals', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  return ok(res, collections.signals.slice(0, limit));
+});
+
+// --- Admin support reply (admin sends a message to a user's convo) ---
+app.post('/api/admin/support/:convoId/reply', async (req, res, next) => {
+  try {
+    const { text } = req.body || {};
+    if (!text) return failBadRequest(res, 'Reply text required');
+    const convo = dataStore.getConvo(req.params.convoId);
+    if (!convo) return failNotFound(res, 'Conversation not found');
+    const msg = dataStore.addMessage(convo.id, { from: 'admin', text });
+    // Send via Telegram to the user
+    try { await services.sendTelegramMessage(convo.tgId, text); }
+    catch (err) { logger.warn('admin reply telegram failed', { err: err.message }); }
+    if (broadcastSupportFn) broadcastSupportFn({ convoId: convo.id, msg, event: 'admin_message' });
+    return created(res, { convo, msg });
+  } catch (err) { next(err); }
+});
+
+// --- User ban ---
+app.post('/api/admin/users/:tgId/ban', (req, res) => {
+  const u = dataStore.getUser(req.params.tgId);
+  if (!u) return failNotFound(res, 'User not found');
+  const updated = dataStore.upsertUser({ ...u, status: 'BANNED' });
+  return ok(res, updated);
+});
+
+// --- User unban ---
+app.post('/api/admin/users/:tgId/unban', (req, res) => {
+  const u = dataStore.getUser(req.params.tgId);
+  if (!u) return failNotFound(res, 'User not found');
+  const updated = dataStore.upsertUser({ ...u, status: 'ACTIVE' });
+  return ok(res, updated);
+});
+
+// --- User promote (change level) ---
+app.post('/api/admin/users/:tgId/promote', (req, res) => {
+  const u = dataStore.getUser(req.params.tgId);
+  if (!u) return failNotFound(res, 'User not found');
+  const { level } = req.body || {};
+  if (![0, 1, 2, 3].includes(level)) return failBadRequest(res, 'Level must be 0, 1, 2, or 3');
+  const planMap = { 0: 'Basic', 1: 'Pro', 2: 'Pro', 3: 'Elite' };
+  const amountMap = { 0: 50, 1: 75, 2: 75, 3: 100 };
+  const updated = dataStore.upsertUser({
+    ...u, level,
+    subscriptionStatus: level > 0 ? 'ACTIVE' : 'INACTIVE',
+    subscriptionPlan: level > 0 ? planMap[level] : null,
+    subscriptionAmount: level > 0 ? amountMap[level] : 0,
+    promotedAt: new Date().toISOString(),
+  });
+  return ok(res, updated);
+});
+
+// --- Bot session control (user starts/stops their bot session) ---
+app.post('/api/bots/session/start', authMiddleware, (req, res) => {
+  const u = dataStore.getUser(req.tgUser.id);
+  if (u) dataStore.upsertUser({ ...u, botRunning: true });
+  return ok(res, { running: true, message: 'Bot session started' });
+});
+app.post('/api/bots/session/stop', authMiddleware, (req, res) => {
+  const u = dataStore.getUser(req.tgUser.id);
+  if (u) dataStore.upsertUser({ ...u, botRunning: false });
+  return ok(res, { running: false, message: 'Bot session stopped' });
+});
+
+// --- User profile (for the Web App) ---
+app.get('/api/me', authMiddleware, (req, res) => {
+  const u = dataStore.getUser(req.tgUser.id);
+  return ok(res, {
+    id: req.tgUser.id,
+    name: [req.tgUser.firstName, req.tgUser.lastName].filter(Boolean).join(' '),
+    username: req.tgUser.username,
+    photoUrl: req.tgUser.photoUrl,
+    language: req.tgUser.language,
+    platform: req.tgUser.platform,
+    subscriptionStatus:    u?.subscriptionStatus    || 'INACTIVE',
+    subscriptionPlan:      u?.subscriptionPlan      || null,
+    subscriptionPlanId:    u?.subscriptionPlanId    || null,
+    subscriptionAmount:    u?.subscriptionAmount    || 0,
+    subscriptionStartedAt: u?.subscriptionStartedAt || null,
+    subscriptionExpiresAt: u?.subscriptionExpiresAt || null,
+    autoRenewal:           u?.autoRenewal           || false,
+    signalsRemaining:      u?.signalsRemaining      ?? 0,
+    signalsSent:           u?.signalsSent           ?? 0,
+    signalsTotal:          u?.signalsTotal          ?? 0,
+    botRunning:            u?.botRunning            || false,
+    strategy:              u?.strategy              || 'strong',
+  });
+});
+
+// --- User update their own settings (platform, strategy) ---
+app.put('/api/me', authMiddleware, (req, res) => {
+  const u = dataStore.getUser(req.tgUser.id);
+  const { platform, strategy } = req.body || {};
+  const updated = dataStore.upsertUser({
+    ...(u || { id: req.tgUser.id, firstName: req.tgUser.firstName, lastName: req.tgUser.lastName,
+               username: req.tgUser.username, photoUrl: req.tgUser.photoUrl, language: req.tgUser.language }),
+    id: req.tgUser.id,
+    platform: platform || u?.platform || 'QUOTEX',
+    strategy: strategy || u?.strategy || 'strong',
+  });
+  return ok(res, {
+    id: updated.id,
+    platform: updated.platform,
+    strategy: updated.strategy,
+  });
 });
 
 // ============================================================================
