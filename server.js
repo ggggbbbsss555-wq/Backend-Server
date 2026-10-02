@@ -25,6 +25,7 @@ import rateLimit from 'express-rate-limit';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { WebSocketServer } from 'ws';
+import { MongoClient } from 'mongodb';
 
 dotenv.config();
 
@@ -41,6 +42,15 @@ const config = {
 
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   internalSecret:   process.env.INTERNAL_SECRET || 'dev-internal-secret',
+
+  // MongoDB — if set, all data persists to MongoDB (write-through cache).
+  // If not set, falls back to in-memory only (dev mode, data lost on restart).
+  mongodbUrl: process.env.MONGODB_URL || '',
+  mongodbDb:  process.env.MONGODB_DB  || 'quantvexa',
+
+  // Admin credentials (for the admin dashboard login)
+  adminEmail:    process.env.ADMIN_EMAIL    || 'admin@dashboard.io',
+  adminPassword: process.env.ADMIN_PASSWORD || 'Admin@2024',
 
   python: {
     candleUrl:   process.env.PYTHON_CANDLE_URL   || 'http://localhost:9001',
@@ -88,6 +98,130 @@ const fail = (res, { code = 'INTERNAL', message = 'Something went wrong', status
 const failBadRequest  = (res, msg = 'Bad request',  d) => fail(res, { code: 'BAD_REQUEST',  message: msg, status: 400, details: d });
 const failUnauthorized= (res, msg = 'Unauthorized') => fail(res, { code: 'UNAUTHORIZED', message: msg, status: 401 });
 const failNotFound    = (res, msg = 'Not found')    => fail(res, { code: 'NOT_FOUND',    message: msg, status: 404 });
+
+// ============================================================================
+// MONGODB LAYER — write-through cache
+// If MONGODB_URL is set, every write to dataStore also persists to MongoDB
+// (fire-and-forget async). On startup, all data is loaded from MongoDB into
+// the in-memory Maps. If MONGODB_URL is not set, in-memory only (dev mode).
+// ============================================================================
+let mongoDb = null;
+
+async function connectMongoDB() {
+  if (!config.mongodbUrl) {
+    logger.info('MONGODB_URL not set — using in-memory only (dev mode)');
+    return;
+  }
+  try {
+    const client = new MongoClient(config.mongodbUrl, { serverSelectionTimeoutMS: 5000 });
+    await client.connect();
+    mongoDb = client.db(config.mongodbDb);
+    logger.info('✅ MongoDB connected', { db: config.mongodbDb });
+    await loadFromDB();
+  } catch (err) {
+    logger.error('MongoDB connection failed — falling back to in-memory', { err: err.message });
+    mongoDb = null;
+  }
+}
+
+async function loadFromDB() {
+  if (!mongoDb) return;
+  try {
+    // Users
+    const users = await mongoDb.collection('users').find({}).toArray();
+    users.forEach(u => collections.users.set(u.id, u));
+    // Subscriptions
+    const subs = await mongoDb.collection('subscriptions').find({}).toArray();
+    subs.forEach(s => collections.subscriptions.set(s.id, s));
+    // Convos (stored by both id and tgId)
+    const convos = await mongoDb.collection('convos').find({}).toArray();
+    convos.forEach(c => { collections.convos.set(c.id, c); collections.convos.set(c.tgId, c); });
+    // Signals (newest first, max 500)
+    const signals = await mongoDb.collection('signals').find({}).sort({ createdAt: -1 }).limit(500).toArray();
+    collections.signals = signals.reverse();
+    // Payments config
+    const payDoc = await mongoDb.collection('config').findOne({ _id: 'payments' });
+    if (payDoc?.methods) Object.entries(payDoc.methods).forEach(([k, v]) => collections.payments.set(k, v));
+    // Notifications
+    const notifs = await mongoDb.collection('notifications').find({}).sort({ sentAt: -1 }).toArray();
+    collections.notifications = notifs;
+    // Promos
+    const promos = await mongoDb.collection('promos').find({}).toArray();
+    collections.promos = promos;
+    // Offers
+    const offers = await mongoDb.collection('offers').find({}).toArray();
+    collections.offers = offers;
+
+    logger.info('data loaded from MongoDB', {
+      users: collections.users.size,
+      subscriptions: collections.subscriptions.size,
+      convos: Math.floor(collections.convos.size / 2),
+      signals: collections.signals.length,
+      notifications: collections.notifications.length,
+      promos: collections.promos.length,
+      offers: collections.offers.length,
+    });
+  } catch (err) {
+    logger.error('loadFromDB failed', { err: err.message });
+  }
+}
+
+// Fire-and-forget persist helper — never blocks the request, never throws
+function mongoPersist(collectionName, operation, filter, doc) {
+  if (!mongoDb) return;
+  const col = mongoDb.collection(collectionName);
+  if (operation === 'insert') {
+    col.insertOne(doc).catch(e => logger.warn('mongo insert failed', { collection: collectionName, err: e.message }));
+  } else if (operation === 'replace') {
+    col.replaceOne(filter, doc, { upsert: true }).catch(e => logger.warn('mongo replace failed', { collection: collectionName, err: e.message }));
+  } else if (operation === 'update') {
+    col.updateOne(filter, doc).catch(e => logger.warn('mongo update failed', { collection: collectionName, err: e.message }));
+  } else if (operation === 'delete') {
+    col.deleteOne(filter).catch(e => logger.warn('mongo delete failed', { collection: collectionName, err: e.message }));
+  }
+}
+
+// ============================================================================
+// ADMIN AUTH — token-based (HMAC signed)
+// Admin logs in with email + password → gets a signed token valid for 24h.
+// The token is: base64(email:expiresAt) + HMAC signature.
+// ============================================================================
+function hashPassword(password) {
+  return crypto.createHmac('sha256', config.internalSecret).update(password).digest('hex');
+}
+
+function generateAdminToken(email) {
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24h
+  const payload = Buffer.from(`${email}:${expiresAt}`).toString('base64');
+  const sig = crypto.createHmac('sha256', config.internalSecret).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function verifyAdminToken(token) {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  const calcSig = crypto.createHmac('sha256', config.internalSecret).update(payload).digest('hex');
+  if (sig !== calcSig) return null;
+  try {
+    const decoded = Buffer.from(payload, 'base64').toString('utf8');
+    const [email, expiresAt] = decoded.split(':');
+    if (Date.now() > parseInt(expiresAt, 10)) return null;
+    return { email, expiresAt: parseInt(expiresAt, 10) };
+  } catch { return null; }
+}
+
+function adminAuthMiddleware(req, res, next) {
+  const auth = req.get('Authorization') || '';
+  let token = '';
+  if (auth.startsWith('Bearer ')) token = auth.slice(7);
+  else if (auth.startsWith('Admin ')) token = auth.slice(6);
+  const result = verifyAdminToken(token);
+  if (!result) return failUnauthorized(res, 'Invalid or expired admin token');
+  req.admin = result;
+  next();
+}
 
 // ============================================================================
 // TELEGRAM INIT-DATA VERIFICATION
@@ -245,9 +379,12 @@ const pythonBridge = {
 };
 
 // ============================================================================
-// DATA STORE — in-memory (swap for Firestore/Postgres later)
+// DATA STORE — in-memory Maps/arrays with MongoDB write-through persistence.
+// All reads are synchronous (fast). All writes also persist to MongoDB
+// (fire-and-forget) so data survives restarts. On boot, loadFromDB()
+// populates the Maps from MongoDB.
 // Shape mirrors the admin dashboard's localStorage records so the dashboard
-// can read/write the same data once Firebase is wired up.
+// can read/write the same data.
 // ============================================================================
 const collections = {
   users:         new Map(),
@@ -255,6 +392,9 @@ const collections = {
   convos:        new Map(),
   signals:       [],
   payments:      new Map(),
+  notifications: [],   // admin-sent notifications
+  promos:        [],   // promo/discount codes
+  offers:        [],   // promotional offers
 };
 
 const dataStore = {
@@ -263,6 +403,7 @@ const dataStore = {
   upsertUser(user) {
     const u = { ...user, id: String(user.id), updatedAt: Date.now() };
     collections.users.set(u.id, u);
+    mongoPersist('users', 'replace', { _id: u.id }, { ...u, _id: u.id });
     return u;
   },
   listUsers() { return Array.from(collections.users.values()); },
@@ -280,6 +421,7 @@ const dataStore = {
     const r = { id: 'sr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
                 status: 'pending', createdAt: Date.now(), ...req };
     collections.subscriptions.set(r.id, r);
+    mongoPersist('subscriptions', 'insert', { _id: r.id }, { ...r, _id: r.id });
     logger.info('sub request added', { id: r.id, tgId: r.tgId, plan: r.planName });
     return r;
   },
@@ -288,6 +430,7 @@ const dataStore = {
     if (!r) return null;
     Object.assign(r, patch, { resolvedAt: Date.now() });
     collections.subscriptions.set(id, r);
+    mongoPersist('subscriptions', 'replace', { _id: id }, { ...r, _id: id });
     return r;
   },
 
@@ -306,6 +449,7 @@ const dataStore = {
                 status: 'open', unread: 0, messages: [], createdAt: Date.now() };
     collections.convos.set(c.id, c);
     collections.convos.set(key, c);
+    mongoPersist('convos', 'insert', { _id: c.id }, { ...c, _id: c.id });
     return c;
   },
   addMessage(convoId, msg) {
@@ -314,11 +458,16 @@ const dataStore = {
     const m = { id: 'm_' + Date.now().toString(36), at: Date.now(), ...msg };
     c.messages.push(m);
     if (m.from === 'user') c.unread = (c.unread || 0) + 1;
+    mongoPersist('convos', 'replace', { _id: c.id }, { ...c, _id: c.id });
     return m;
   },
   markRead(convoId) {
     const c = collections.convos.get(convoId);
-    if (c) { c.unread = 0; return c; }
+    if (c) {
+      c.unread = 0;
+      mongoPersist('convos', 'replace', { _id: c.id }, { ...c, _id: c.id });
+      return c;
+    }
     return null;
   },
 
@@ -329,12 +478,14 @@ const dataStore = {
                 createdAt: Date.now(), result: null, profit: null, ...sig };
     collections.signals.unshift(s);
     if (collections.signals.length > 500) collections.signals.length = 500;
+    mongoPersist('signals', 'insert', { _id: s.id }, { ...s, _id: s.id });
     return s;
   },
   resolveSignal(id, result, profit) {
     const s = collections.signals.find(x => x.id === id);
     if (!s) return null;
     s.result = result; s.profit = profit; s.resolvedAt = Date.now();
+    mongoPersist('signals', 'replace', { _id: id }, { ...s, _id: id });
     return s;
   },
 
@@ -350,7 +501,74 @@ const dataStore = {
   },
   setPayment(methodId, cfg) {
     collections.payments.set(methodId, cfg);
+    const methods = Object.fromEntries(collections.payments);
+    mongoPersist('config', 'replace', { _id: 'payments' }, { _id: 'payments', methods });
     return collections.payments.get(methodId);
+  },
+
+  // Notifications (admin-sent)
+  listNotifications() { return collections.notifications; },
+  addNotification(notif) {
+    const n = { id: 'n_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                sentAt: Date.now(), sentCount: 0, ...notif };
+    collections.notifications.unshift(n);
+    mongoPersist('notifications', 'insert', { _id: n.id }, { ...n, _id: n.id });
+    return n;
+  },
+  deleteNotification(id) {
+    const idx = collections.notifications.findIndex(n => n.id === id);
+    if (idx === -1) return false;
+    collections.notifications.splice(idx, 1);
+    mongoPersist('notifications', 'delete', { _id: id }, null);
+    return true;
+  },
+
+  // Promos (discount codes)
+  listPromos() { return collections.promos; },
+  addPromo(promo) {
+    const p = { id: 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                activated: 0, createdAt: Date.now(), ...promo };
+    collections.promos.unshift(p);
+    mongoPersist('promos', 'insert', { _id: p.id }, { ...p, _id: p.id });
+    return p;
+  },
+  deletePromo(id) {
+    const idx = collections.promos.findIndex(p => p.id === id);
+    if (idx === -1) return false;
+    collections.promos.splice(idx, 1);
+    mongoPersist('promos', 'delete', { _id: id }, null);
+    return true;
+  },
+  togglePromo(id) {
+    const p = collections.promos.find(x => x.id === id);
+    if (!p) return null;
+    p.active = !p.active;
+    mongoPersist('promos', 'replace', { _id: id }, { ...p, _id: id });
+    return p;
+  },
+
+  // Offers (promotional)
+  listOffers() { return collections.offers; },
+  addOffer(offer) {
+    const o = { id: 'o_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                active: true, createdAt: Date.now(), ...offer };
+    collections.offers.unshift(o);
+    mongoPersist('offers', 'insert', { _id: o.id }, { ...o, _id: o.id });
+    return o;
+  },
+  deleteOffer(id) {
+    const idx = collections.offers.findIndex(o => o.id === id);
+    if (idx === -1) return false;
+    collections.offers.splice(idx, 1);
+    mongoPersist('offers', 'delete', { _id: id }, null);
+    return true;
+  },
+  toggleOffer(id) {
+    const o = collections.offers.find(x => x.id === id);
+    if (!o) return null;
+    o.active = !o.active;
+    mongoPersist('offers', 'replace', { _id: id }, { ...o, _id: id });
+    return o;
   },
 };
 
@@ -666,8 +884,30 @@ app.get('/api/bots/status', authMiddleware, async (req, res, next) => {
 });
 
 // ============================================================================
-// ROUTES — Admin dashboard (Firebase later; for now use internal-secret)
+// ROUTES — Admin dashboard
+// Login: POST /api/admin/login (email + password → admin token)
+// All other admin routes require adminAuthMiddleware (Bearer token)
 // ============================================================================
+
+// --- Admin login (public — no token needed, just email + password) ---
+app.post('/api/admin/login', (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return failBadRequest(res, 'Email and password required');
+  if (email !== config.adminEmail || password !== config.adminPassword) {
+    return failUnauthorized(res, 'Invalid admin credentials');
+  }
+  const token = generateAdminToken(email);
+  return ok(res, { token, email, expiresIn: 24 * 60 * 60 * 1000 });
+});
+
+// --- All admin routes below require a valid admin token ---
+app.use('/api/admin', (req, res, next) => {
+  // Skip auth for the login route (already handled above)
+  if (req.path === '/login') return next();
+  return adminAuthMiddleware(req, res, next);
+});
+
+// Subscriptions
 app.get('/api/admin/subscriptions', (req, res) => ok(res, dataStore.listSubRequests(req.query.status ? { status: req.query.status } : {})));
 app.post('/api/admin/subscriptions/:id/approve', async (req, res, next) => {
   try { return ok(res, await subscriptionsService.approve(req.params.id, req.body?.note || '')); }
@@ -677,8 +917,12 @@ app.post('/api/admin/subscriptions/:id/reject', async (req, res, next) => {
   try { return ok(res, await subscriptionsService.reject(req.params.id, req.body?.note || '')); }
   catch (err) { next(err); }
 });
+
+// Support
 app.get('/api/admin/support/convos', (req, res) => ok(res, supportService.listAll()));
 app.post('/api/admin/support/:convoId/mark-read', (req, res) => ok(res, supportService.markRead(req.params.convoId)));
+
+// Servers + strategies
 app.post('/api/admin/servers/:id/toggle', async (req, res, next) => {
   try {
     if (typeof req.body?.running !== 'boolean') return failBadRequest(res, 'Missing "running" boolean');
@@ -691,11 +935,77 @@ app.post('/api/admin/strategies/:id/toggle', async (req, res, next) => {
     return ok(res, await serversService.toggleStrategy(req.params.id, req.body.enabled));
   } catch (err) { next(err); }
 });
+
+// Payments
 app.get('/api/admin/payments', (req, res) => ok(res, dataStore.getPayments()));
 app.put('/api/admin/payments/:methodId', (req, res) => ok(res, dataStore.setPayment(req.params.methodId, req.body || {})));
+
+// Users
 app.get('/api/admin/users', (req, res) => ok(res, dataStore.listUsers()));
+app.get('/api/admin/users/:tgId', (req, res) => {
+  const u = dataStore.getUser(req.params.tgId);
+  if (!u) return failNotFound(res, 'User not found');
+  return ok(res, u);
+});
+app.put('/api/admin/users/:tgId', (req, res) => {
+  const u = dataStore.getUser(req.params.tgId);
+  if (!u) return failNotFound(res, 'User not found');
+  const updated = dataStore.upsertUser({ ...u, ...req.body, id: req.params.tgId });
+  return ok(res, updated);
+});
+
+// Plans + strategies + platforms (read-only catalogs)
 app.get('/api/admin/strategies', (req, res) => ok(res, STRATEGIES));
 app.get('/api/admin/platforms', (req, res) => ok(res, PLATFORMS));
+
+// Notifications
+app.get('/api/admin/notifications', (req, res) => ok(res, dataStore.listNotifications()));
+app.post('/api/admin/notifications', (req, res) => {
+  const { title, body, channel, target } = req.body || {};
+  if (!title || !body) return failBadRequest(res, 'title and body required');
+  return created(res, dataStore.addNotification({ title, body, channel: channel || 'ALL', target: target || null }));
+});
+app.delete('/api/admin/notifications/:id', (req, res) => {
+  const deleted = dataStore.deleteNotification(req.params.id);
+  if (!deleted) return failNotFound(res, 'Notification not found');
+  return ok(res, { deleted: true });
+});
+
+// Promos
+app.get('/api/admin/promos', (req, res) => ok(res, dataStore.listPromos()));
+app.post('/api/admin/promos', (req, res) => {
+  const { code, audience, maxUsers, discountPct } = req.body || {};
+  if (!code) return failBadRequest(res, 'code required');
+  return created(res, dataStore.addPromo({ code, audience: audience || 'ALL', maxUsers: maxUsers || 100, discountPct: discountPct || 10 }));
+});
+app.delete('/api/admin/promos/:id', (req, res) => {
+  const deleted = dataStore.deletePromo(req.params.id);
+  if (!deleted) return failNotFound(res, 'Promo not found');
+  return ok(res, { deleted: true });
+});
+app.post('/api/admin/promos/:id/toggle', (req, res) => {
+  const p = dataStore.togglePromo(req.params.id);
+  if (!p) return failNotFound(res, 'Promo not found');
+  return ok(res, p);
+});
+
+// Offers
+app.get('/api/admin/offers', (req, res) => ok(res, dataStore.listOffers()));
+app.post('/api/admin/offers', (req, res) => {
+  const { title, body } = req.body || {};
+  if (!title || !body) return failBadRequest(res, 'title and body required');
+  return created(res, dataStore.addOffer({ title, body }));
+});
+app.delete('/api/admin/offers/:id', (req, res) => {
+  const deleted = dataStore.deleteOffer(req.params.id);
+  if (!deleted) return failNotFound(res, 'Offer not found');
+  return ok(res, { deleted: true });
+});
+app.post('/api/admin/offers/:id/toggle', (req, res) => {
+  const o = dataStore.toggleOffer(req.params.id);
+  if (!o) return failNotFound(res, 'Offer not found');
+  return ok(res, o);
+});
 
 // ============================================================================
 // INTERNAL WEBHOOKS — Python → Node.js (require X-Internal-Secret)
@@ -798,9 +1108,15 @@ function setupWebSocket(server) {
 const server = http.createServer(app);
 setupWebSocket(server);
 
-server.listen(config.port, () => {
-  logger.info('🚀 Backend server ready', {
-    port: config.port, env: config.nodeEnv, wsPath: '/ws', python: config.python,
+// Connect to MongoDB (write-through cache) — non-blocking, falls back to
+// in-memory if MONGODB_URL is not set or connection fails.
+connectMongoDB().then(() => {
+  server.listen(config.port, () => {
+    logger.info('🚀 Backend server ready', {
+      port: config.port, env: config.nodeEnv, wsPath: '/ws',
+      python: config.python,
+      mongo: mongoDb ? 'connected' : 'in-memory-only',
+    });
   });
 });
 
