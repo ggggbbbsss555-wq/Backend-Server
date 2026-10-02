@@ -1,0 +1,34 @@
+{
+  "name": "quantvexa-backend",
+  "version": "1.0.0",
+  "description": "Node.js bridge server between Telegram Web App, Python codebase (candle/telegram/signals bots), and Firebase admin dashboard",
+  "main": "src/server.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "echo \"TODO: tests\" && exit 0"
+  },
+  "dependencies": {
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "telegram",
+    "webapp",
+    "trading",
+    "signals",
+    "bridge",
+    "quantvexa"
+  ],
+  "license": "MIT"
+}
