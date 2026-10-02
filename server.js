@@ -52,12 +52,6 @@ const config = {
   adminEmail:    process.env.ADMIN_EMAIL    || 'admin@dashboard.io',
   adminPassword: process.env.ADMIN_PASSWORD || 'Admin@2024',
 
-  python: {
-    // Single URL — all 3 Python services run on ONE port now (Railway-friendly).
-    // Routes are prefixed: /candle/*, /telegram/*, /signals/*
-    url: process.env.PYTHON_URL || process.env.PYTHON_CANDLE_URL || 'http://localhost:8080',
-  },
-
   // Plan prices locked to 50/75/100 — match the admin dashboard + quantvexa/plans
   plans: {
     basic: parseInt(process.env.PLAN_BASIC_PRICE || '50', 10),
@@ -325,57 +319,256 @@ function errorHandler(err, req, res, _next) {
 }
 
 // ============================================================================
-// PYTHON BRIDGE — HTTP client to the 3 Python services
+// NATIVE SERVICES — Candle generator + Signals generator + Telegram bot
+// (replaces the Python backend — everything runs in this single Node.js process)
 // ============================================================================
-async function pythonCall(url, opts = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), opts.timeout ?? 8000);
+
+// --- Telegram Bot API (direct HTTP calls, no Python needed) ---
+const TG_API = config.telegramBotToken ? `https://api.telegram.org/bot${config.telegramBotToken}` : '';
+async function tgCall(method, payload = {}) {
+  if (!TG_API) return null;
   try {
-    const res = await fetch(url, {
-      method: opts.method || 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Internal-Secret': config.internalSecret,
-        ...(opts.headers || {}),
-      },
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-      signal: controller.signal,
+    const r = await fetch(`${TG_API}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
-    const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-    if (!res.ok) {
-      logger.warn('python call non-2xx', { url, status: res.status, body: text?.slice(0, 200) });
-      const e = new Error(`Python ${url} returned ${res.status}`);
-      e.status = res.status; e.body = data; throw e;
-    }
-    return data;
-  } finally {
-    clearTimeout(timeout);
-  }
+    const data = await r.json();
+    if (!data.ok) { logger.warn('telegram api error', { method, description: data.description }); return null; }
+    return data.result;
+  } catch (err) { logger.warn('telegram api failed', { method, err: err.message }); return null; }
+}
+async function tgSendMessage(chatId, text) {
+  return tgCall('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML' });
 }
 
-const pythonBridge = {
-  // Candle server (prefixed /candle/*)
+// Telegram long-polling thread (forwards user messages to support chat)
+let tgPollingTimer = null;
+let tgLastUpdateId = 0;
+async function tgPollingLoop() {
+  if (!TG_API) return;
+  try {
+    const payload = { timeout: 25, allowed_updates: ['message'] };
+    if (tgLastUpdateId) payload.offset = tgLastUpdateId + 1;
+    const r = await fetch(`${TG_API}/getUpdates`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      for (const update of data.result) {
+        tgLastUpdateId = update.update_id;
+        const msg = update.message;
+        if (!msg || !msg.text) continue;
+        const user = msg.from || {};
+        const userName = [user.first_name, user.last_name].filter(Boolean).join(' ');
+        logger.info('telegram support message', { tgId: user.id, name: userName, text: msg.text.slice(0, 60) });
+        // Store as support message from user
+        const convo = dataStore.getOrCreateConvo(String(user.id), { name: userName });
+        dataStore.addMessage(convo.id, { from: 'user', text: msg.text });
+        if (broadcastSupportFn) broadcastSupportFn({ convoId: convo.id, msg: { text: msg.text }, event: 'user_message' });
+      }
+    }
+  } catch (err) {
+    logger.warn('telegram polling error', { err: err.message });
+  }
+  // Schedule next poll
+  tgPollingTimer = setTimeout(tgPollingLoop, 1000);
+}
+function startTgPolling() {
+  if (!TG_API) { logger.warn('TELEGRAM_BOT_TOKEN not set — polling disabled'); return; }
+  logger.info('telegram polling started');
+  tgPollingLoop();
+}
+function stopTgPolling() {
+  if (tgPollingTimer) { clearTimeout(tgPollingTimer); tgPollingTimer = null; }
+}
+
+// --- Candle data (deterministic OHLCV generation — same symbol = same chart) ---
+
+const CANDLE_SYMBOLS = [
+  { symbol: 'BRLUSD-OTC', price: 0.1985, change: 0.42 },
+  { symbol: 'USDARS-OTC', price: 985.50, change: -0.31 },
+  { symbol: 'USDBDT-OTC', price: 117.25, change: 0.18 },
+  { symbol: 'USDCOP-OTC', price: 4150.75, change: -0.55 },
+  { symbol: 'USDEGP-OTC', price: 48.85, change: 0.12 },
+  { symbol: 'USDIDR-OTC', price: 15820.50, change: -0.28 },
+  { symbol: 'USDINR-OTC', price: 83.42, change: 0.22 },
+  { symbol: 'USDMXN-OTC', price: 17.15, change: -0.41 },
+  { symbol: 'USDNGN-OTC', price: 1485.30, change: 0.67 },
+  { symbol: 'USDPHP-OTC', price: 56.78, change: -0.19 },
+  { symbol: 'USDPKR-OTC', price: 278.45, change: 0.34 },
+  { symbol: 'USDZAR-OTC', price: 18.92, change: -0.48 },
+  { symbol: 'EURUSD-OTC', price: 1.0852, change: 0.18 },
+  { symbol: 'GBPUSD-OTC', price: 1.3025, change: -0.12 },
+  { symbol: 'USDJPY-OTC', price: 149.85, change: 0.27 },
+  { symbol: 'AUDUSD-OTC', price: 0.6582, change: -0.08 },
+  { symbol: 'USDCAD-OTC', price: 1.3585, change: 0.15 },
+  { symbol: 'EURJPY-OTC', price: 163.45, change: 0.31 },
+  { symbol: 'EURGBP-OTC', price: 0.8338, change: -0.05 },
+  { symbol: 'GBPJPY-OTC', price: 195.42, change: 0.22 },
+  { symbol: 'BTC/USDT', price: 67234.50, change: 1.42 },
+  { symbol: 'ETH/USDT', price: 3456.20, change: 0.95 },
+  { symbol: 'SOL/USDT', price: 178.50, change: -0.31 },
+  { symbol: 'XRP/USDT', price: 0.5432, change: 0.18 },
+  { symbol: 'AVAX/USDT', price: 38.76, change: -0.55 },
+  { symbol: 'DOGE/USDT', price: 0.1654, change: 0.34 },
+];
+
+const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+
+// Seeded PRNG (mulberry32) — deterministic per symbol
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function gauss(rng, mean, std) {
+  // Box-Muller transform
+  const u1 = rng() || 0.0001;
+  const u2 = rng();
+  return mean + std * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+function genCandles(symbol, timeframe, limit) {
+  const seed = parseInt(crypto.createHash('sha256').update(symbol).digest('hex').slice(0, 8), 16);
+  const rng = mulberry32(seed);
+  const symInfo = CANDLE_SYMBOLS.find(s => s.symbol === symbol);
+  const basePrice = symInfo ? symInfo.price : 100;
+  const volatility = Math.max(0.0005, Math.log10(basePrice + 1) * 0.001);
+  const tfSec = TIMEFRAME_SECONDS[timeframe] || 60;
+  const now = Math.floor(Date.now() / 1000);
+  const startTime = now - limit * tfSec;
+  const candles = [];
+  let price = basePrice;
+  for (let i = 0; i < limit; i++) {
+    const ts = startTime + i * tfSec;
+    const drift = (basePrice - price) * 0.02;
+    const change = gauss(rng, drift, volatility * price);
+    const open = price;
+    const close = Math.max(0.0001, price + change);
+    const wickUp = Math.abs(gauss(rng, 0, volatility * price * 0.5));
+    const wickDn = Math.abs(gauss(rng, 0, volatility * price * 0.5));
+    const high = Math.max(open, close) + wickUp;
+    const low = Math.min(open, close) - wickDn;
+    const volume = Math.floor(rng() * 9900) + 100;
+    candles.push({ time: ts, open: round5(open), high: round5(high), low: round5(low), close: round5(close), volume });
+    price = close;
+  }
+  return candles;
+}
+function round5(n) { return Math.round(n * 100000) / 100000; }
+
+// --- Signals generator (creates a new signal every SIGNAL_INTERVAL_SEC) ---
+const SIGNAL_STRATEGIES = {
+  strong: { id: 'strong', name: 'Strong', color: '#00ff88', winRate: 0.55, costPerSignal: 1, minSec: 60, maxSec: 180 },
+  medium: { id: 'medium', name: 'Medium', color: '#00d2ff', winRate: 0.65, costPerSignal: 3, minSec: 120, maxSec: 300 },
+  pro:    { id: 'pro',    name: 'Pro',    color: '#ab82ff', winRate: 0.78, costPerSignal: 6, minSec: 300, maxSec: 900 },
+};
+const SIGNAL_SYMBOLS_POOL = ['EURUSD-OTC', 'GBPUSD-OTC', 'USDJPY-OTC', 'AUDUSD-OTC', 'USDCAD-OTC', 'EURJPY-OTC'];
+const SIGNAL_BASE_PRICES = { 'EURUSD-OTC': 1.0852, 'GBPUSD-OTC': 1.3025, 'USDJPY-OTC': 149.85, 'AUDUSD-OTC': 0.6582, 'USDCAD-OTC': 1.3585, 'EURJPY-OTC': 163.45 };
+let runningStrategies = new Set(['strong', 'medium', 'pro']);
+let sigGenTimer = null;
+
+function genSignal() {
+  const enabled = [...runningStrategies].filter(s => SIGNAL_STRATEGIES[s]);
+  if (enabled.length === 0) return null;
+  const strategyId = enabled[Math.floor(Math.random() * enabled.length)];
+  const strat = SIGNAL_STRATEGIES[strategyId];
+  const symbol = SIGNAL_SYMBOLS_POOL[Math.floor(Math.random() * SIGNAL_SYMBOLS_POOL.length)];
+  const type = Math.random() < 0.5 ? 'buy' : 'sell';
+  const duration = Math.floor(Math.random() * (strat.maxSec - strat.minSec + 1)) + strat.minSec;
+  const entry = SIGNAL_BASE_PRICES[symbol] || Math.round(Math.random() * 200 * 10000) / 10000;
+  return {
+    id: 'sig_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+    symbol, type, entry, duration,
+    startTime: Math.floor(Date.now() / 1000),
+    result: null, profit: null,
+    strategy: strategyId, platform: 'QUOTEX',
+    createdAt: Date.now(),
+  };
+}
+function resolveSignalLocal(sig) {
+  const strat = SIGNAL_STRATEGIES[sig.strategy] || SIGNAL_STRATEGIES.strong;
+  const win = Math.random() < strat.winRate;
+  sig.result = win ? 'win' : 'lose';
+  const bp = Math.random() * 1.5 + 0.3;
+  sig.profit = Math.round((win ? bp : -(bp * 0.7)) * 100) / 100;
+  sig.resolvedAt = Date.now();
+}
+function sigGenTick() {
+  // 1) Resolve expired signals
+  const now = Date.now() / 1000;
+  for (const sig of collections.signals) {
+    if (sig.result !== null) continue;
+    if (now - sig.startTime >= sig.duration) {
+      resolveSignalLocal(sig);
+      mongoPersist('signals', 'replace', { _id: sig.id }, { ...sig, _id: sig.id });
+      if (broadcastSignalFn) broadcastSignalFn({ ...sig, event: 'resolved' });
+    }
+  }
+  // 2) Generate a new signal
+  if (runningStrategies.size > 0) {
+    const sig = genSignal();
+    if (sig) {
+      collections.signals.unshift(sig);
+      if (collections.signals.length > 500) collections.signals.length = 500;
+      mongoPersist('signals', 'insert', { _id: sig.id }, { ...sig, _id: sig.id });
+      logger.info('signal generated', { id: sig.id, symbol: sig.symbol, type: sig.type, strategy: sig.strategy });
+      if (broadcastSignalFn) broadcastSignalFn(sig);
+    }
+  }
+  // Schedule next tick
+  const intervalMs = (parseInt(process.env.SIGNAL_INTERVAL_SEC, 10) || 30) * 1000;
+  sigGenTimer = setTimeout(sigGenTick, intervalMs);
+}
+function startSigGenerator() {
+  logger.info('signals generator started', { interval: process.env.SIGNAL_INTERVAL_SEC || 30, strategies: [...runningStrategies] });
+  sigGenTick();
+}
+function stopSigGenerator() {
+  if (sigGenTimer) { clearTimeout(sigGenTimer); sigGenTimer = null; }
+}
+
+// --- Native service interface (replaces pythonBridge) ---
+const nativeServices = {
+  // Candle
+  getSymbols() { return Promise.resolve(CANDLE_SYMBOLS); },
   getCandles(symbol, timeframe = '1m', limit = 200) {
-    return pythonCall(`${config.python.url}/candle/candles/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`);
+    return Promise.resolve({
+      symbol, timeframe,
+      candles: genCandles(symbol, timeframe, Math.min(Math.max(1, limit), 1000)),
+    });
   },
-  getSymbols() { return pythonCall(`${config.python.url}/candle/symbols`); },
-
-  // Telegram bot (prefixed /telegram/*)
-  sendTelegramMessage(tgUserId, text) {
-    return pythonCall(`${config.python.url}/telegram/send`, { method: 'POST', body: { tg_user_id: tgUserId, text } });
+  // Telegram
+  async sendTelegramMessage(tgUserId, text) { return tgSendMessage(tgUserId, text); },
+  async notifySubscriptionUpdate(tgUserId, status, planName) {
+    const text = status === 'approved'
+      ? `✅ <b>Payment Verified</b>\n\nYour payment has been verified and you've been upgraded to the <b>${planName}</b> plan. Enjoy your new features!`
+      : `❌ <b>Payment Rejected</b>\n\nYour payment for the <b>${planName}</b> plan was rejected. This is your final warning — please contact support for details.`;
+    return tgSendMessage(tgUserId, text);
   },
-  notifySubscriptionUpdate(tgUserId, status, planName) {
-    return pythonCall(`${config.python.url}/telegram/notify-subscription`, { method: 'POST', body: { tg_user_id: tgUserId, status, plan_name: planName } });
+  // Signals
+  async controlBot(strategy, action) {
+    if (!SIGNAL_STRATEGIES[strategy]) throw new Error(`Unknown strategy: ${strategy}`);
+    if (action === 'start') runningStrategies.add(strategy);
+    else if (action === 'stop') runningStrategies.delete(strategy);
+    logger.info('bot control', { strategy, action, running: [...runningStrategies] });
+    return { strategy, action, running_strategies: [...runningStrategies] };
   },
-
-  // Signals bots (prefixed /signals/*)
-  controlBot(strategy, action) {
-    return pythonCall(`${config.python.url}/signals/bot/control`, { method: 'POST', body: { strategy, action } });
+  async getBotStatus() {
+    const active = collections.signals.filter(s => s.result === null).length;
+    return {
+      running: runningStrategies.size > 0,
+      strategies: Object.values(SIGNAL_STRATEGIES).map(s => ({ ...s, enabled: runningStrategies.has(s.id) })),
+      platforms: [{ id: 'QUOTEX', running: true }, { id: 'BINOLLA', running: true }],
+      signals_total: collections.signals.length,
+      signals_active: active,
+    };
   },
-  getBotStatus() { return pythonCall(`${config.python.url}/signals/bot/status`); },
-  getRecentSignals(limit = 50) { return pythonCall(`${config.python.url}/signals/list?limit=${limit}`); },
+  async getRecentSignals(limit = 50) { return collections.signals.slice(0, limit); },
 };
 
 // ============================================================================
@@ -621,7 +814,7 @@ const PLATFORMS = [
 const serversService = {
   async listPlatforms() {
     try {
-      const status = await pythonBridge.getBotStatus();
+      const status = await nativeServices.getBotStatus();
       if (status?.data?.platforms) return status.data.platforms;
     } catch (_) { /* fall through to local */ }
     return PLATFORMS;
@@ -629,7 +822,7 @@ const serversService = {
   async togglePlatform(id, running) {
     const p = PLATFORMS.find(x => x.id === id);
     if (p) p.running = running;
-    try { await pythonBridge.controlBot(id.toLowerCase(), running ? 'start' : 'stop'); }
+    try { await nativeServices.controlBot(id.toLowerCase(), running ? 'start' : 'stop'); }
     catch (err) { logger.warn('python controlBot failed', { id, err: err.message }); }
     return p;
   },
@@ -637,7 +830,7 @@ const serversService = {
   async toggleStrategy(id, enabled) {
     const s = STRATEGIES.find(x => x.id === id);
     if (s) s.enabled = enabled;
-    try { await pythonBridge.controlBot(id, enabled ? 'start' : 'stop'); }
+    try { await nativeServices.controlBot(id, enabled ? 'start' : 'stop'); }
     catch (err) { logger.warn('python controlBot failed', { id, err: err.message }); }
     return s;
   },
@@ -682,7 +875,7 @@ const subscriptionsService = {
         autoRenewal: true,
       });
     }
-    try { await pythonBridge.notifySubscriptionUpdate(req.tgId, 'approved', req.planName); }
+    try { await nativeServices.notifySubscriptionUpdate(req.tgId, 'approved', req.planName); }
     catch (err) { logger.warn('failed to notify telegram bot of approval', { id, err: err.message }); }
     logger.info('subscription approved', { id, plan: req.planName });
     return dataStore.getSubRequest(id);
@@ -692,7 +885,7 @@ const subscriptionsService = {
     if (!req) { const e = new Error('Request not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e; }
     if (req.status !== 'pending') { const e = new Error(`Request already ${req.status}`); e.status = 400; e.code = 'ALREADY_RESOLVED'; throw e; }
     dataStore.updateSubRequest(id, { status: 'rejected', adminNote });
-    try { await pythonBridge.notifySubscriptionUpdate(req.tgId, 'rejected', req.planName); }
+    try { await nativeServices.notifySubscriptionUpdate(req.tgId, 'rejected', req.planName); }
     catch (err) { logger.warn('failed to notify telegram bot of rejection', { id, err: err.message }); }
     logger.info('subscription rejected', { id });
     return dataStore.getSubRequest(id);
@@ -721,15 +914,15 @@ const signalsService = {
     const local = dataStore.listSignals(limit);
     if (local.length > 0) return local;
     try {
-      const remote = await pythonBridge.getRecentSignals(limit);
+      const remote = await nativeServices.getRecentSignals(limit);
       return Array.isArray(remote) ? remote : (remote?.data || []);
     } catch (err) { logger.warn('failed to fetch signals from python', { err: err.message }); return []; }
   },
   async botStatus() {
-    try { return await pythonBridge.getBotStatus(); }
+    try { return await nativeServices.getBotStatus(); }
     catch (err) { logger.warn('bot status fetch failed', { err: err.message }); return null; }
   },
-  async controlBot(strategy, action) { return await pythonBridge.controlBot(strategy, action); },
+  async controlBot(strategy, action) { return await nativeServices.controlBot(strategy, action); },
 };
 
 // ============================================================================
@@ -743,7 +936,7 @@ const supportService = {
     });
     const msg = dataStore.addMessage(convo.id, { from: 'user', text: text || '', image: image || null });
     try {
-      await pythonBridge.sendTelegramMessage(0, `💬 New support message from ${convo.userName || tgUser.id}:\n\n${text || '(image)'}`);
+      await nativeServices.sendTelegramMessage(0, `💬 New support message from ${convo.userName || tgUser.id}:\n\n${text || '(image)'}`);
     } catch (err) { logger.warn('failed to forward user message to telegram bot', { err: err.message }); }
     if (broadcastSupportFn) broadcastSupportFn({ convoId: convo.id, msg, event: 'user_message' });
     return { convo, msg };
@@ -851,14 +1044,14 @@ app.get('/api/signals/:id', authMiddleware, (req, res) => {
 
 // --- Candles (proxied to Python candle service) ---
 app.get('/api/symbols', authMiddleware, async (req, res, next) => {
-  try { return ok(res, await pythonBridge.getSymbols()); }
+  try { return ok(res, await nativeServices.getSymbols()); }
   catch (err) { logger.warn('candle /symbols proxy failed', { err: err.message }); return ok(res, []); }
 });
 app.get('/api/candles/:symbol', authMiddleware, async (req, res, next) => {
   try {
     const timeframe = (req.query.timeframe || '1m');
     const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
-    return ok(res, await pythonBridge.getCandles(req.params.symbol, timeframe, limit));
+    return ok(res, await nativeServices.getCandles(req.params.symbol, timeframe, limit));
   } catch (err) { logger.warn('candle proxy failed', { symbol: req.params.symbol, err: err.message }); return ok(res, []); }
 });
 
@@ -1111,16 +1304,31 @@ setupWebSocket(server);
 // Connect to MongoDB (write-through cache) — non-blocking, falls back to
 // in-memory if MONGODB_URL is not set or connection fails.
 connectMongoDB().then(() => {
+  // Start native services (Telegram polling + signals generator)
+  startTgPolling();
+  startSigGenerator();
+
   server.listen(config.port, () => {
     logger.info('🚀 Backend server ready', {
       port: config.port, env: config.nodeEnv, wsPath: '/ws',
-      python: config.python,
       mongo: mongoDb ? 'connected' : 'in-memory-only',
+      telegram: TG_API ? 'polling' : 'disabled',
+      signals: 'generator-running',
     });
   });
 });
 
-process.on('SIGTERM', () => { logger.info('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('SIGINT',  () => { logger.info('SIGINT received, shutting down...');  server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down...');
+  stopSigGenerator();
+  stopTgPolling();
+  server.close(() => process.exit(0));
+});
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down...');
+  stopSigGenerator();
+  stopTgPolling();
+  server.close(() => process.exit(0));
+});
 
 export default app;
