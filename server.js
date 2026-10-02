@@ -53,9 +53,9 @@ const config = {
   adminPassword: process.env.ADMIN_PASSWORD || 'Admin@2024',
 
   python: {
-    candleUrl:   process.env.PYTHON_CANDLE_URL   || 'http://localhost:9001',
-    telegramUrl: process.env.PYTHON_TELEGRAM_URL || 'http://localhost:9002',
-    signalsUrl:  process.env.PYTHON_SIGNALS_URL  || 'http://localhost:9003',
+    // Single URL — all 3 Python services run on ONE port now (Railway-friendly).
+    // Routes are prefixed: /candle/*, /telegram/*, /signals/*
+    url: process.env.PYTHON_URL || process.env.PYTHON_CANDLE_URL || 'http://localhost:8080',
   },
 
   // Plan prices locked to 50/75/100 — match the admin dashboard + quantvexa/plans
@@ -356,26 +356,26 @@ async function pythonCall(url, opts = {}) {
 }
 
 const pythonBridge = {
-  // Candle server
+  // Candle server (prefixed /candle/*)
   getCandles(symbol, timeframe = '1m', limit = 200) {
-    return pythonCall(`${config.python.candleUrl}/candles/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`);
+    return pythonCall(`${config.python.url}/candle/candles/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`);
   },
-  getSymbols() { return pythonCall(`${config.python.candleUrl}/symbols`); },
+  getSymbols() { return pythonCall(`${config.python.url}/candle/symbols`); },
 
-  // Telegram bot
+  // Telegram bot (prefixed /telegram/*)
   sendTelegramMessage(tgUserId, text) {
-    return pythonCall(`${config.python.telegramUrl}/send`, { method: 'POST', body: { tg_user_id: tgUserId, text } });
+    return pythonCall(`${config.python.url}/telegram/send`, { method: 'POST', body: { tg_user_id: tgUserId, text } });
   },
   notifySubscriptionUpdate(tgUserId, status, planName) {
-    return pythonCall(`${config.python.telegramUrl}/notify-subscription`, { method: 'POST', body: { tg_user_id: tgUserId, status, plan_name: planName } });
+    return pythonCall(`${config.python.url}/telegram/notify-subscription`, { method: 'POST', body: { tg_user_id: tgUserId, status, plan_name: planName } });
   },
 
-  // Signals bots
+  // Signals bots (prefixed /signals/*)
   controlBot(strategy, action) {
-    return pythonCall(`${config.python.signalsUrl}/bot/control`, { method: 'POST', body: { strategy, action } });
+    return pythonCall(`${config.python.url}/signals/bot/control`, { method: 'POST', body: { strategy, action } });
   },
-  getBotStatus() { return pythonCall(`${config.python.signalsUrl}/bot/status`); },
-  getRecentSignals(limit = 50) { return pythonCall(`${config.python.signalsUrl}/signals?limit=${limit}`); },
+  getBotStatus() { return pythonCall(`${config.python.url}/signals/bot/status`); },
+  getRecentSignals(limit = 50) { return pythonCall(`${config.python.url}/signals/list?limit=${limit}`); },
 };
 
 // ============================================================================
