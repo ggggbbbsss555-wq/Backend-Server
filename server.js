@@ -242,63 +242,16 @@ function adminAuthMiddleware(req, res, next) {
 }
 
 // ============================================================================
-// CANDLE DATA — deterministic OHLCV (no sensitive data, generated natively)
+// CANDLE CACHE — residential server pushes real candle data here
+// (NO fake data — all candles come from the real QUOTEX/BINOLLA servers)
 // ============================================================================
-const CANDLE_SYMBOLS = [
-  { symbol: 'BRLUSD-OTC', price: 0.1985, change: 0.42 }, { symbol: 'USDARS-OTC', price: 985.50, change: -0.31 },
-  { symbol: 'USDBDT-OTC', price: 117.25, change: 0.18 }, { symbol: 'USDCOP-OTC', price: 4150.75, change: -0.55 },
-  { symbol: 'USDEGP-OTC', price: 48.85, change: 0.12 }, { symbol: 'USDIDR-OTC', price: 15820.50, change: -0.28 },
-  { symbol: 'USDINR-OTC', price: 83.42, change: 0.22 }, { symbol: 'USDMXN-OTC', price: 17.15, change: -0.41 },
-  { symbol: 'USDNGN-OTC', price: 1485.30, change: 0.67 }, { symbol: 'USDPHP-OTC', price: 56.78, change: -0.19 },
-  { symbol: 'USDPKR-OTC', price: 278.45, change: 0.34 }, { symbol: 'USDZAR-OTC', price: 18.92, change: -0.48 },
-  { symbol: 'EURUSD-OTC', price: 1.0852, change: 0.18 }, { symbol: 'GBPUSD-OTC', price: 1.3025, change: -0.12 },
-  { symbol: 'USDJPY-OTC', price: 149.85, change: 0.27 }, { symbol: 'AUDUSD-OTC', price: 0.6582, change: -0.08 },
-  { symbol: 'USDCAD-OTC', price: 1.3585, change: 0.15 }, { symbol: 'EURJPY-OTC', price: 163.45, change: 0.31 },
-  { symbol: 'EURGBP-OTC', price: 0.8338, change: -0.05 }, { symbol: 'GBPJPY-OTC', price: 195.42, change: 0.22 },
-  { symbol: 'BTC/USDT', price: 67234.50, change: 1.42 }, { symbol: 'ETH/USDT', price: 3456.20, change: 0.95 },
-  { symbol: 'SOL/USDT', price: 178.50, change: -0.31 }, { symbol: 'XRP/USDT', price: 0.5432, change: 0.18 },
-  { symbol: 'AVAX/USDT', price: 38.76, change: -0.55 }, { symbol: 'DOGE/USDT', price: 0.1654, change: 0.34 },
-];
-const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
-function mulberry32(seed) {
-  return function() {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
-function gauss(rng, mean, std) {
-  const u1 = rng() || 0.0001, u2 = rng();
-  return mean + std * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-}
-function genCandles(symbol, timeframe, limit) {
-  const seed = parseInt(crypto.createHash('sha256').update(symbol).digest('hex').slice(0, 8), 16);
-  const rng = mulberry32(seed);
-  const symInfo = CANDLE_SYMBOLS.find(s => s.symbol === symbol);
-  const basePrice = symInfo ? symInfo.price : 100;
-  const volatility = Math.max(0.0005, Math.log10(basePrice + 1) * 0.001);
-  const tfSec = TIMEFRAME_SECONDS[timeframe] || 60;
-  const now = Math.floor(Date.now() / 1000);
-  const startTime = now - limit * tfSec;
-  const candles = [];
-  let price = basePrice;
-  for (let i = 0; i < limit; i++) {
-    const ts = startTime + i * tfSec;
-    const drift = (basePrice - price) * 0.02;
-    const change = gauss(rng, drift, volatility * price);
-    const open = price;
-    const close = Math.max(0.0001, price + change);
-    const wickUp = Math.abs(gauss(rng, 0, volatility * price * 0.5));
-    const wickDn = Math.abs(gauss(rng, 0, volatility * price * 0.5));
-    const high = Math.max(open, close) + wickUp;
-    const low = Math.min(open, close) - wickDn;
-    const volume = Math.floor(rng() * 9900) + 100;
-    candles.push({ time: ts, open: Math.round(open*1e5)/1e5, high: Math.round(high*1e5)/1e5, low: Math.round(low*1e5)/1e5, close: Math.round(close*1e5)/1e5, volume });
-    price = close;
-  }
-  return candles;
-}
+const candleCache = {
+  symbols: [],           // residential pushes via POST /internal/candles/symbols
+  candles: new Map(),    // key: "symbol|timeframe" → { symbol, timeframe, candles, updatedAt }
+  setSymbols(syms) { this.symbols = syms; },
+  setCandles(symbol, timeframe, candles) { this.candles.set(`${symbol}|${timeframe}`, { symbol, timeframe, candles, updatedAt: Date.now() }); },
+  getCandles(symbol, timeframe) { return this.candles.get(`${symbol}|${timeframe}`); },
+};
 
 // ============================================================================
 // DATA STORE — in-memory + MongoDB write-through
@@ -531,13 +484,13 @@ app.get('/api/subscriptions/status', authMiddleware, (req, res) => {
 app.get('/api/signals', authMiddleware, (req, res) => ok(res, dataStore.listSignals(Math.min(parseInt(req.query.limit, 10) || 50, 200))));
 app.get('/api/signals/:id', authMiddleware, (req, res) => { const sig = dataStore.listSignals(500).find(s => s.id === req.params.id); if (!sig) return failNotFound(res, 'Signal not found'); return ok(res, sig); });
 
-// Candles (generated natively — no sensitive data)
-app.get('/api/symbols', authMiddleware, (req, res) => ok(res, CANDLE_SYMBOLS));
+// Candles (served from cache — residential server pushes real data)
+app.get('/api/symbols', authMiddleware, (req, res) => ok(res, candleCache.symbols));
 app.get('/api/candles/:symbol', authMiddleware, (req, res) => {
   const tf = req.query.timeframe || '1m';
-  if (!TIMEFRAME_SECONDS[tf]) return failBadRequest(res, 'Bad timeframe');
-  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
-  return ok(res, { symbol: req.params.symbol, timeframe: tf, candles: genCandles(req.params.symbol, tf, limit) });
+  const cached = candleCache.getCandles(req.params.symbol, tf);
+  if (!cached) return ok(res, { symbol: req.params.symbol, timeframe: tf, candles: [] });
+  return ok(res, cached);
 });
 
 // Support
@@ -693,6 +646,26 @@ app.post('/internal/support/message', internalAuth, (req, res) => {
 app.post('/internal/bot/status', internalAuth, (req, res) => {
   logger.info('bot status from residential', { body: req.body });
   return ok(res, { received: true });
+});
+
+// --- Candle data: residential server pushes REAL candle data from QUOTEX/BINOLLA ---
+
+// Push symbol list (residential calls this periodically or on startup)
+app.post('/internal/candles/symbols', internalAuth, (req, res) => {
+  const { symbols } = req.body || {};
+  if (!Array.isArray(symbols)) return failBadRequest(res, 'symbols array required');
+  candleCache.setSymbols(symbols);
+  logger.info('candle symbols updated from residential', { count: symbols.length });
+  return ok(res, { received: true, count: symbols.length });
+});
+
+// Push candle data for a specific symbol + timeframe
+app.post('/internal/candles/:symbol', internalAuth, (req, res) => {
+  const { timeframe, candles } = req.body || {};
+  if (!timeframe || !Array.isArray(candles)) return failBadRequest(res, 'timeframe and candles[] required');
+  candleCache.setCandles(req.params.symbol, timeframe, candles);
+  logger.info('candles cached from residential', { symbol: req.params.symbol, timeframe, count: candles.length });
+  return ok(res, { received: true, count: candles.length });
 });
 
 // --- Notification queue: residential server polls this, sends via Telegram, marks as sent ---
