@@ -465,12 +465,33 @@ app.get('/api/plans/:id', (req, res) => { const p = PLANS.find(x => x.id === req
 app.get('/api/payment-methods', (req, res) => ok(res, dataStore.getPayments()));
 
 // Subscriptions
+// Generate a verification code for Binance Pay: PAY-XXXXXX (6 alphanumeric chars)
+function generateVerificationCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return 'PAY-' + code;
+}
+
 app.post('/api/subscriptions/request', authMiddleware, (req, res, next) => {
   try {
     const plan = PLANS.find(p => p.id === req.body.planId);
     if (!plan) return failBadRequest(res, 'Invalid plan');
     if (!['binance', 'trc20', 'bep20'].includes(req.body.paymentMethod)) return failBadRequest(res, 'Invalid payment method');
-    const r = dataStore.addSubRequest({ tgId: req.tgUser.id, userName: [req.tgUser.firstName, req.tgUser.lastName].filter(Boolean).join(' '), username: req.tgUser.username, planId: plan.id, planName: plan.name, amount: plan.price, currency: plan.currency, paymentMethod: req.body.paymentMethod, transactionId: req.body.transactionId, receiptImage: req.body.receiptImage || null, note: req.body.note || '' });
+    // Generate verification code for Binance Pay (user sends this code via Binance Pay to the admin's Pay ID)
+    const verificationCode = req.body.paymentMethod === 'binance' ? generateVerificationCode() : null;
+    const r = dataStore.addSubRequest({
+      tgId: req.tgUser.id,
+      userName: [req.tgUser.firstName, req.tgUser.lastName].filter(Boolean).join(' '),
+      username: req.tgUser.username,
+      planId: plan.id, planName: plan.name, amount: plan.price, currency: plan.currency,
+      paymentMethod: req.body.paymentMethod,
+      transactionId: req.body.transactionId,
+      verificationCode,  // ← stored so admin can see it
+      receiptImage: req.body.receiptImage || null,
+      note: req.body.note || '',
+    });
+    logger.info('subscription request created', { id: r.id, plan: plan.name, method: req.body.paymentMethod, verificationCode });
     return created(res, r);
   } catch (err) { next(err); }
 });
