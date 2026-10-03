@@ -146,8 +146,41 @@ function mongoPersist(col, op, filter, doc) {
 }
 
 // ============================================================================
-// TELEGRAM INIT-DATA VERIFICATION (no bot token needed — residential verifies)
+// USER AUTH — lightweight (X-TG-User header with {id, name, username, photo})
+// No init_data needed — the residential server does real Telegram verification.
 // ============================================================================
+function getTGUserFromRequest(req) {
+  // Try X-TG-User header first (lightweight — just user object)
+  const header = req.get('X-TG-User');
+  if (header) {
+    try {
+      const u = JSON.parse(header);
+      if (u && u.id) return {
+        id: String(u.id),
+        firstName: u.name?.split(' ')[0] || u.firstName || '',
+        lastName: u.name?.split(' ').slice(1).join(' ') || u.lastName || '',
+        username: u.username || '',
+        photoUrl: u.photo || u.photoUrl || '',
+        language: u.lang || u.language || 'en',
+        platform: u.platform || 'QUOTEX',
+      };
+    } catch {}
+  }
+  // Fallback: try init_data (for backwards compat)
+  const raw = extractInitData(req);
+  if (raw) return verifyInitData(raw);
+  return null;
+}
+
+function extractInitData(req) {
+  const auth = req.get('Authorization') || '';
+  if (auth.startsWith('tma '))      return auth.slice(4);
+  if (auth.startsWith('Telegram ')) return auth.slice(9);
+  if (req.query['tg-init-data'])    return String(req.query['tg-init-data']);
+  return null;
+}
+
+// Fallback: parse init_data if X-TG-User header is not present
 function verifyInitData(raw) {
   try {
     const params = new URLSearchParams(raw);
@@ -160,13 +193,6 @@ function verifyInitData(raw) {
       platform: 'QUOTEX',
     };
   } catch { return null; }
-}
-function extractInitData(req) {
-  const auth = req.get('Authorization') || '';
-  if (auth.startsWith('tma '))      return auth.slice(4);
-  if (auth.startsWith('Telegram ')) return auth.slice(9);
-  if (req.query['tg-init-data'])    return String(req.query['tg-init-data']);
-  return null;
 }
 
 // ============================================================================
@@ -181,14 +207,12 @@ function corsMiddleware() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-TG-User'],
   });
 }
 function authMiddleware(req, res, next) {
-  const raw = extractInitData(req);
-  if (!raw) return failUnauthorized(res, 'Missing Telegram initData');
-  const user = verifyInitData(raw);
-  if (!user) return failUnauthorized(res, 'Invalid Telegram initData');
+  const user = getTGUserFromRequest(req);
+  if (!user) return failUnauthorized(res, 'Missing user data');
   req.tgUser = user;
   next();
 }
@@ -449,14 +473,25 @@ app.get('/health', (req, res) => res.json({ ok: true, role: 'api-hub', mongo: mo
 // ROUTES — Web App
 // ============================================================================
 
-// Auth
+// Auth — accepts lightweight user data (tg_id, tg_name, tg_username, tg_photo)
 app.post('/api/auth/telegram', (req, res) => {
-  const { init_data } = req.body || {};
-  if (!init_data) return failBadRequest(res, 'Missing init_data');
-  const user = verifyInitData(init_data);
-  if (!user) return failUnauthorized(res, 'Invalid Telegram initData');
-  const u = dataStore.upsertUser({ ...user, lastSeen: Date.now() });
-  return ok(res, { user: { id: u.id, name: [u.firstName, u.lastName].filter(Boolean).join(' '), username: u.username, photoUrl: u.photoUrl, language: u.language }, session_token: init_data });
+  const { tg_id, tg_name, tg_username, tg_photo, tg_lang, tg_platform } = req.body || {};
+  if (!tg_id) return failBadRequest(res, 'Missing tg_id');
+  const nameParts = (tg_name || '').split(' ');
+  const user = {
+    id: String(tg_id),
+    firstName: nameParts[0] || '',
+    lastName: nameParts.slice(1).join(' ') || '',
+    username: tg_username || '',
+    photoUrl: tg_photo || '',
+    language: tg_lang || 'en',
+    platform: tg_platform || 'QUOTEX',
+    lastSeen: Date.now(),
+  };
+  const u = dataStore.upsertUser(user);
+  return ok(res, {
+    user: { id: u.id, name: [u.firstName, u.lastName].filter(Boolean).join(' '), username: u.username, photoUrl: u.photoUrl, language: u.language },
+  });
 });
 
 // Plans
@@ -720,7 +755,13 @@ function setupWebSocket(server) {
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'auth') {
-        const user = verifyInitData(msg.init_data);
+        // Lightweight auth — accept user object directly (no init_data)
+        let user = null;
+        if (msg.user) {
+          user = { id: String(msg.user.id), firstName: msg.user.name?.split(' ')[0] || '', lastName: msg.user.name?.split(' ').slice(1).join(' ') || '', username: msg.user.username || '', photoUrl: msg.user.photo || '', language: msg.user.lang || 'en', platform: msg.user.platform || 'QUOTEX' };
+        } else if (msg.init_data) {
+          user = verifyInitData(msg.init_data);  // fallback
+        }
         if (!user) { ws.close(4001, 'invalid auth'); return; }
         ws._authed = true; ws._tgId = user.id; attachUser(ws._tgId, ws);
         ws.send(JSON.stringify({ channel: 'system', data: { ok: true, message: 'authenticated' } }));
