@@ -47,7 +47,7 @@ const config = {
   nodeEnv:        process.env.NODE_ENV || 'development',
   logLevel:       process.env.LOG_LEVEL || 'info',
 
-  allowedOrigins: (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173')
+  allowedOrigins: (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173,https://adminquantvexa.web.app,https://quantvexa.web.app,https://ggggbbbsss555-wq.github.io')
     .split(',').map(s => s.trim()).filter(Boolean),
 
   internalSecret: process.env.INTERNAL_SECRET || 'dev-internal-secret',
@@ -201,13 +201,19 @@ function verifyInitData(raw) {
 function corsMiddleware() {
   return cors({
     origin(origin, cb) {
+      // Allow same-origin / no-origin requests (curl, server-to-server, mobile webviews)
       if (!origin) return cb(null, true);
       if (config.allowedOrigins.includes(origin)) return cb(null, true);
+      // Also allow any *.web.app and *.firebaseapp.com (Firebase Hosting domains)
+      if (/^https:\/\/[a-z0-9-]+\.web\.app$/i.test(origin)) return cb(null, true);
+      if (/^https:\/\/[a-z0-9-]+\.firebaseapp\.com$/i.test(origin)) return cb(null, true);
       return cb(new Error(`Origin not allowed: ${origin}`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-TG-User'],
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   });
 }
 function authMiddleware(req, res, next) {
